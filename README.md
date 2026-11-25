@@ -1,232 +1,122 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/9335b488-ffcc-4157-8364-2370a0b70ad0">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/3a7eeb08-1133-47f5-859c-fad4f5a6a013">
-  <img alt="NGINX Banner">
-</picture>
+# NOZ
 
-[![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
-[![Community Forum](https://img.shields.io/badge/community-forum-009639?logo=discourse&link=https%3A%2F%2Fcommunity.nginx.org)](https://community.nginx.org)
-[![License](https://img.shields.io/badge/License-BSD%202--Clause-blue.svg)](/LICENSE)
-[![Code of Conduct](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](/CODE_OF_CONDUCT.md)
+> **NGINX 的安全边界与整数尺寸运算实验**
+>
+> NOZ 基于 NGINX 1.31.9 源码，重点探索一条贯穿内存分配、容器扩容、HTTP 响应编码与 HTTP/3/QPACK 编码路径的改造主线：**在尺寸进入分配或指针运算之前，先做可检查的加法、乘法与对齐计算；遇到不可表示或超出约定范围的尺寸时，明确失败，而不是让整数回绕继续流入后续逻辑。**
 
-NGINX (pronounced "engine x" or "en-jin-eks") is the world's most popular Web Server, high performance Load Balancer, Reverse Proxy, API Gateway and Content Cache.
+[![NGINX](https://img.shields.io/badge/based%20on-NGINX%201.31.9-009639)](https://nginx.org/)
+[![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](LICENSE)
 
-NGINX is free and open source software, distributed under the terms of a simplified [2-clause BSD-like license](LICENSE).
+## 项目在做什么
 
-Enterprise distributions, commercial support and training are available from [F5, Inc](https://www.f5.com/products/nginx).
+NOZ 保留 NGINX 的整体服务器与模块架构，并在核心尺寸计算路径加入私有的整数安全算术辅助层，再把它用于多个真实调用点。配套测试不只检查辅助函数本身，也覆盖了 HTTP 头部和 HTTP/3 编码相关的边界，以及分配失败时的响应行为。
 
-> [!IMPORTANT]
-> The goal of this README is to provide a basic, structured introduction to NGINX for novice users. Please refer to the [full NGINX documentation](https://nginx.org/en/docs/) for detailed information on [installing](https://nginx.org/en/docs/install.html), [building](https://nginx.org/en/docs/configure.html), [configuring](https://nginx.org/en/docs/dirindex.html), [debugging](https://nginx.org/en/docs/debugging_log.html), and more. These documentation pages also contain a more detailed [Beginners Guide](https://nginx.org/en/docs/beginners_guide.html), How-Tos, [Development guide](https://nginx.org/en/docs/dev/development_guide.html), and a complete module and [directive reference](https://nginx.org/en/docs/dirindex.html).
+这不是一份“已全面加固”或“已通过完整安全审计”的声明。它是一个围绕源码改造、边界条件验证和性能对照展开的工程实验；具体行为、兼容性与安全性仍需结合构建选项和实际测试结果判断。
 
-# Table of contents
-- [How it works](#how-it-works)
-  - [Modules](#modules)
-  - [Configurations](#configurations)
-  - [Runtime](#runtime)
-- [Downloading and installing](#downloading-and-installing)
-  - [Stable and Mainline binaries](#stable-and-mainline-binaries)
-  - [Linux binary installation process](#linux-binary-installation-process)
-  - [FreeBSD installation process](#freebsd-installation-process)
-  - [Windows executables](#windows-executables)
-  - [Dynamic modules](#dynamic-modules)
-- [Getting started with NGINX](#getting-started-with-nginx)
-  - [Installing SSL certificates and enabling TLS encryption](#installing-ssl-certificates-and-enabling-tls-encryption)
-  - [Load Balancing](#load-balancing)
-  - [Rate limiting](#rate-limiting)
-  - [Content caching](#content-caching)
-- [Building from source](#building-from-source)
-  - [Installing dependencies](#installing-dependencies)
-  - [Cloning the NGINX GitHub repository](#cloning-the-nginx-github-repository)
-  - [Configuring the build](#configuring-the-build)
-  - [Compiling](#compiling)
-  - [Location of binary and installation](#location-of-binary-and-installation)
-  - [Running and testing the installed binary](#running-and-testing-the-installed-binary)
-- [Asking questions and reporting issues](#asking-questions-and-reporting-issues)
-- [Contributing code](#contributing-code)
-- [Additional help and resources](#additional-help-and-resources)
-- [Changelog](#changelog)
-- [License](#license)
+## 主要改造与看点
 
-# How it works
-NGINX is installed software with binary packages available for all major operating systems and Linux distributions. See [Tested OS and Platforms](https://nginx.org/en/#tested_os_and_platforms) for a full list of compatible systems.
+### 1. 私有的 checked-size 算术层
 
-> [!IMPORTANT]
-> While nearly all popular Linux-based operating systems are distributed with a community version of nginx, we highly advise installation and usage of official [packages](https://nginx.org/en/linux_packages.html) or sources from this repository. Doing so ensures that you're using the most recent release or source code, including the latest feature-set, fixes and security patches.
+新增 `src/core/private/include/ngx_math.h`，为 NGINX 内部提供轻量、无外部库依赖的尺寸运算工具：
 
-## Modules
-NGINX is comprised of individual modules, each extending core functionality by providing additional, configurable features. See "Modules reference" at the bottom of [nginx documentation](https://nginx.org/en/docs/) for a complete list of official modules.
+- **尺寸有效性检查**：预留 `NGX_MAX_SIZE_T_VALUE` 作为不可分配的溢出哨兵值，避免把失败结果误当作正常尺寸。
+- **checked add / multiply**：提供 `ngx_priv_math_add_size()`、`ngx_priv_math_mul_size()` 和 `ngx_priv_math_add_uint()`；出错时返回 `NGX_ERROR`，并写入哨兵值。
+- **双实现路径**：支持编译器溢出内建函数；不可用或通过 `NGX_PRIV_MATH_NO_BUILTIN` 禁用时，回退到可移植的边界检查实现。
+- **饱和累计**：提供饱和加法、乘法，以及累计 2–5 个尺寸的辅助函数，适合编码前预估多个字段或片段的总长度。
+- **安全对齐**：验证对齐值为非零的 2 的幂，并在向上取整前检查加法溢出。
 
-NGINX modules can be built and distributed as static or dynamic modules. Static modules are defined at build-time, compiled, and distributed in the resulting binaries. See [Dynamic Modules](#dynamic-modules) for more information on how they work, as well as, how to obtain, install, and configure them.
+### 2. 把检查接入实际内存与容器路径
 
-> [!TIP]
-> You can issue the following command to see which static modules your NGINX binaries were built with:
-```bash
-nginx -V
-```
-> See [Configuring the build](#configuring-the-build) for information on how to include specific Static modules into your nginx build.
+这套运算不是孤立的工具头文件：它已用于若干核心分配和尺寸计算入口，例如：
 
-## Configurations
-NGINX is highly flexible and configurable. Provisioning the software is achieved via text-based config file(s) accepting parameters called "[Directives](https://nginx.org/en/docs/dirindex.html)". See [Configuration File's Structure](https://nginx.org/en/docs/beginners_guide.html#conf_structure) for a comprehensive description of how NGINX configuration files work.
+- `src/core/ngx_palloc.c`：检查内存池创建、普通分配和对齐分配的尺寸；超出可接受范围时在进入分配路径前失败。
+- `src/core/ngx_array.h`、`src/core/ngx_array.c`：数组初始化、批量扩容、元素偏移和容量增长涉及的乘法、加法先行校验。
+- `src/core/ngx_list.h`、`src/core/ngx_list.c`：列表初始化、分块分配和元素偏移计算做尺寸检查。
+- `src/core/ngx_buf.c`：创建多缓冲区链时先检查缓冲区数量与单个缓冲区大小的乘积。
+- `src/core/ngx_thread_pool.c`：分配线程任务时检查任务结构与附加上下文的总大小。
+- `src/http/ngx_http_request_body.c`：请求体缓冲区尺寸增长使用饱和加法，避免扩展尺寸计算发生回绕。
 
-> [!NOTE]
-> The set of directives available to your distribution of NGINX is dependent on which [modules](#modules) have been made available to it.
+这些改动的重点是让“长度计算”在抵达 malloc/pool 分配、数组下标或编码器之前就有明确的成功/失败边界。
 
-## Runtime
-Rather than running in a single, monolithic process, NGINX is architected to scale beyond Operating System process limitations by operating as a collection of processes. They include:
-- A "master" process that maintains worker processes, as well as, reads and evaluates configuration files.
-- One or more "worker" processes that process data (eg. HTTP requests).
+### 3. HTTP 响应头尺寸预估与失败收敛
 
-The number of [worker processes](https://nginx.org/en/docs/ngx_core_module.html#worker_processes) is defined in the configuration file and may be fixed for a given configuration or automatically adjusted to the number of available CPU cores. In most cases, the latter option optimally balances load across available system resources, as NGINX is designed to efficiently distribute work across all worker processes.
+在 `src/http/ngx_http_header_filter_module.c` 中，响应状态行、常见头字段、Location、Keep-Alive、Early Hints 和用户自定义头字段的长度累计改用安全累计函数，再按计算结果创建输出缓冲区。
 
-> [!TIP]
-> Processes synchronize data through shared memory. For this reason, many NGINX directives require the allocation of shared memory zones. As an example, when configuring [rate limiting](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html#limit_req), connecting clients may need to be tracked in a [common memory zone](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html#limit_req_zone) so all worker processes can know how many times a particular client has accessed the server in a span of time.
+当响应头输出缓冲区无法分配时，代码会走 `ngx_http_allocation_failed()`：清理当前响应头状态并尝试以 **503 Service Unavailable** 结束响应，同时关闭 keep-alive，避免在���分响应状态下继续沿用原来的头部输出流程。相关错误响应处理位于 `src/http/ngx_http_special_response.c`。
 
-# Downloading and installing
-Follow these steps to download and install precompiled NGINX binaries. You may also choose to [build NGINX locally from source code](#building-from-source).
+### 4. HTTP/3 / QPACK 编码长度边界
 
-## Stable and Mainline binaries
-NGINX binaries are built and distributed in two versions: stable and mainline. Stable binaries are built from stable branches and only contain critical fixes backported from the mainline version. Mainline binaries are built from the [master branch](https://github.com/nginx/nginx/tree/master) and contain the latest features and bugfixes. You'll need to [decide which is appropriate for your purposes](https://docs.nginx.com/nginx/admin-guide/installing-nginx/installing-nginx-open-source/#choosing-between-a-stable-or-a-mainline-version).
+`src/http/v3/ngx_http_v3_encode.c` 中的字段行和字段区前缀编码器支持以 `p == NULL` 预估所需长度。各类 literal/indexed 字段编码的长度组合通过饱和尺寸累计处理；HTTP/3 响应头、Early Hints、数据帧和 trailers 的相关路径也使用安全累计来预估编码缓冲区大小。
 
-## Linux binary installation process
-The NGINX binary installation process takes advantage of package managers native to specific Linux distributions. For this reason, first-time installations involve adding the official NGINX package repository to your system's package manager. Follow [these steps](https://nginx.org/en/linux_packages.html) to download, verify, and install NGINX binaries using the package manager appropriate for your Linux distribution.
+因此，测试可以直接针对“仅计算长度”的路径传入极端尺寸，而不必真的构造同等大小的输入缓冲区。
 
-### Upgrades
-Future upgrades to the latest version can be managed using the same package manager without the need to manually download and verify binaries.
+### 5. 独立边界测试、协议回归与基准
 
-## FreeBSD installation process
-For more information on installing NGINX on FreeBSD system, visit https://nginx.org/en/docs/install.html
+`tests/` 目录里的材料围绕上述改造提供了几层验证：
 
-## Windows executables
-Windows executables for mainline and stable releases can be found on the main [NGINX download page](https://nginx.org/en/download.html). Note that the current implementation of NGINX for Windows is at the Proof-of-Concept stage and should only be used for development and testing purposes. For additional information, please see [nginx for Windows](https://nginx.org/en/docs/windows.html).
+- **`ngx_private_math_test.c`**：覆盖有效尺寸、加法/乘法溢出、饱和运算、累计与对齐；编译器支持 `__int128` 时，还会用参考计算对一组边界值两两比较。
+- **`ngx_http_v3_size_test.c`**：链接 NGINX HTTP/3 编码对象，验证 QPACK 字段和字段区前缀的长度预估，并用超大长度检查边界返回值。
+- **`ngx_http_safety_test_module.c`**：仅用于测试的 HTTP 模块，通过 `safety_test` 指令触发正常响应、模拟分配失败，以及 pool/array/list/thread/header 尺寸溢出场景。
+- **`ngx_http_h3_safety_client.py`** 与 **`nginx-safety.conf`**：使用 aioquic 对 HTTP/3 测试端点发起请求，并核对预期状态码。
+- **`ngx_private_math_bench.c`**：对照 checked arithmetic 的便携回退实现与编译器内建溢出路径，输出每轮耗时和每操作耗时。基准数据受编译器、优化级别和硬件影响，不应脱离测试环境解读。
 
-## Dynamic modules
-NGINX version 1.9.11 added support for [Dynamic Modules](https://nginx.org/en/docs/ngx_core_module.html#load_module). Unlike Static modules, dynamically built modules can be downloaded, installed, and configured after the core NGINX binaries have been built. [Official dynamic module binaries](https://nginx.org/en/linux_packages.html#dynmodules) are available from the same package repository as the core NGINX binaries described in previous steps.
+测试模块和客户端是验证工具，不是生产功能模块；运行测试时应使用隔离的本地环境，并按自己的构建目录调整 `tests/nginx-safety.conf` 中的路径。
 
-> [!TIP]
-> [NGINX JavaScript (njs)](https://github.com/nginx/njs), is a popular NGINX dynamic module that enables the extension of core NGINX functionality using familiar JavaScript syntax.
+## 代码导航
 
-> [!IMPORTANT]
-> If desired, dynamic modules can also be built statically into NGINX at compile time.
+| 路径 | 用途 |
+| --- | --- |
+| `src/core/private/include/ngx_math.h` | 私有尺寸算术与边界检查辅助函数 |
+| `src/core/ngx_palloc.c`、`src/core/ngx_array.*`、`src/core/ngx_list.*` | 内存池、数组和列表中的尺寸检查接入点 |
+| `src/core/ngx_buf.c`、`src/core/ngx_thread_pool.c` | 缓冲区链和线程任务的分配尺寸检查 |
+| `src/http/ngx_http_header_filter_module.c` | HTTP 响应头与 Early Hints 长度预估 |
+| `src/http/ngx_http_special_response.c` | 分配失败时的 HTTP 错误响应处理 |
+| `src/http/v3/ngx_http_v3_encode.c`、`src/http/v3/ngx_http_v3_filter_module.c` | HTTP/3/QPACK 编码与长度预估 |
+| `tests/` | 算术边界测试、HTTP/HTTP/3 回归测试材料及微基准 |
+| `CHANGES` | 上游版本变更记录 |
 
-# Getting started with NGINX
-For a gentle introduction to NGINX basics, please see our [Beginner’s Guide](https://nginx.org/en/docs/beginners_guide.html).
+## 构建
 
-## Installing SSL certificates and enabling TLS encryption
-See [Configuring HTTPS servers](https://nginx.org/en/docs/http/configuring_https_servers.html) for a quick guide on how to enable secure traffic to your NGINX installation.
+NOZ 使用 NGINX 的 `configure` 构建流程。编译选项和依赖取决于目标系统及需要启用的模块；可先查看可用选项，再配置和编译：
 
-## Load Balancing
-For a quick start guide on configuring NGINX as a Load Balancer, please see [Using nginx as HTTP load balancer](https://nginx.org/en/docs/http/load_balancing.html).
-
-## Rate limiting
-See our [Rate Limiting with NGINX](https://blog.nginx.org/blog/rate-limiting-nginx) blog post for an overview of core concepts for provisioning NGINX as an API Gateway.
-
-## Content caching
-See [A Guide to Caching with NGINX and NGINX Plus](https://blog.nginx.org/blog/nginx-caching-guide) blog post for an overview of how to use NGINX as a content cache (e.g. edge server of a content delivery network).
-
-# Building from source
-The following steps can be used to build NGINX from source code available in this repository.
-
-## Installing dependencies
-Most Linux distributions will require several dependencies to be installed in order to build NGINX. The following instructions are specific to the `apt` package manager, widely available on most Ubuntu/Debian distributions and their derivatives.
-
-> [!TIP]
-> It is always a good idea to update your package repository lists prior to installing new packages.
-> ```bash
-> sudo apt update
-> ```
-
-### Installing compiler and make utility
-Use the following command to install the GNU C compiler and Make utility.
-
-```bash
-sudo apt install gcc make
-```
-
-### Installing dependency libraries
-
-```bash
-sudo apt install libpcre3-dev zlib1g-dev
-```
-
-> [!WARNING]
-> This is the minimal set of dependency libraries needed to build NGINX with rewriting and gzip capabilities. Other dependencies may be required if you choose to build NGINX with additional modules. Monitor the output of the `configure` command discussed in the following sections for information on which modules may be missing. For example, if you plan to use SSL certificates to encrypt traffic with TLS, you'll need to install the OpenSSL library. To do so, issue the following command.
-
->```bash
->sudo apt install libssl-dev
-
-## Cloning the NGINX GitHub repository
-Using your preferred method, clone the NGINX repository into your development directory. See [Cloning a GitHub Repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) for additional help.
-
-```bash
-git clone https://github.com/nginx/nginx.git
-```
-
-## Configuring the build
-Prior to building NGINX, you must run the `configure` script with [appropriate flags](https://nginx.org/en/docs/configure.html). This will generate a Makefile in your NGINX source root directory that can then be used to compile NGINX with [options specified during configuration](https://nginx.org/en/docs/configure.html).
-
-From the NGINX source code repository's root directory:
-
-```bash
-auto/configure
-```
-
-> [!IMPORTANT]
-> Configuring the build without any flags will compile NGINX with the default set of options. Please refer to https://nginx.org/en/docs/configure.html for a full list of available build configuration options.
-
-## Compiling
-The `configure` script will generate a `Makefile` in the NGINX source root directory upon successful execution. To compile NGINX into a binary, issue the following command from that same directory:
-
-```bash
+```sh
+./configure --help
+./configure
 make
-```
 
-## Location of binary and installation
-After successful compilation, a binary will be generated at `<NGINX_SRC_ROOT_DIR>/objs/nginx`. To install this binary, issue the following command from the source root directory:
 
-```bash
-sudo make install
-```
 
-> [!IMPORTANT]
-> The binary will be installed into the `/usr/local/nginx/` directory.
 
-## Running and testing the installed binary
-To run the installed binary, issue the following command:
 
-```bash
-sudo /usr/local/nginx/sbin/nginx
-```
 
-You may test NGINX operation using `curl`.
 
-```bash
-curl localhost
-```
 
-The output of which should start with:
 
-```html
-<!DOCTYPE html>
-<html>
-<head>
-<title>Welcome to nginx!</title>
-```
 
-# Asking questions and reporting issues
-See our [Support](SUPPORT.md) guidelines for information on how discuss the codebase, ask troubleshooting questions, and report issues.
 
-# Contributing code
-Please see the [Contributing](CONTRIBUTING.md) guide for information on how to contribute code.
 
-# Additional help and resources
-- See the [NGINX Community Blog](https://blog.nginx.org/) for more tips, tricks and HOW-TOs related to NGINX and related projects.
-- Access [nginx.org](https://nginx.org/), your go-to source for all documentation, information and software related to the NGINX suite of projects.
 
-# Changelog
-See our [changelog](https://nginx.org/en/CHANGES) to keep track of updates.
 
-# License
-[2-clause BSD-like license](LICENSE)
 
----
-Additional documentation available at: https://nginx.org/en/docs
+
+
+
+有关第三方库、TLS、HTTP/3/QUIC 及其他模块的构建要求，请结合所选 configure 参数和 NGINX 官方构建文档确认。构建测试二进制、模块或运行回归脚本时，也请检查各测试文件中的依赖和路径设置。
+使用与安全说明
+
+    面向生产环境部署前，请自行审查源码改动、编译配置、依赖版本和运行配置。
+    仓库中的安全测试代码用于本地回归验证；它不构成完整安全审计，也不应直接暴露在公网服务中。
+    上游 NGINX 的安全更新与变更记录请持续关注，并根据需要将相关修复同步到本仓库。
+
+上游资料
+
+    NGINX 官方文档
+    NGINX GitHub 仓库
+    本仓库变更记录
+
+贡献与反馈
+
+欢迎通过 GitHub Issues 反馈构建问题、边界案例或测试结果。提交问题时请附上操作系统、编译器、configure 参数、复现步骤和实际输出。安全问题请避免在公开讨论中披露未修复的细节。
+许可证
+
+本仓库许可证见 LICENSE：BSD 2-Clause。
